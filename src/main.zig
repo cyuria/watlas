@@ -14,11 +14,10 @@ pub const std_options = .{
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
     var window: wl.Wayland = undefined;
-    window.init(allocator);
+    try window.init(gpa.allocator());
     defer window.deinit();
 
     window.w = 800;
@@ -33,6 +32,9 @@ pub fn main() !void {
     std.log.debug("Bind Phase Complete", .{});
 
     try window.createSurface();
+    std.log.debug("Surfaces created", .{});
+    try window.roundTrip();
+    std.log.debug("Roundtrip Complete", .{});
 
     while (true) {
         try window.recv();

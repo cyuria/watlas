@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 const wl = @import("protocols/wayland.zig");
 const xdg = @import("protocols/xdg_shell.zig");
 
-const tmpfilebase = "/tmp/statusmap";
+const tmpfilebase = "/tmp/watlas";
 const endian = builtin.cpu.arch.endian();
 const format_xrgb8888: u32 = 1;
 const colour_channels: u32 = 4;
@@ -25,6 +25,7 @@ const cmsghdr_space = roundup(@sizeOf(Cmsghdr), @sizeOf(usize));
 const Id = enum {
     invalid,
     display,
+    callback,
     registry,
     compositor,
     shm,
@@ -38,22 +39,60 @@ const Id = enum {
     const count = @intFromEnum(@This().toplevel) + 1;
 };
 
-const Registry = struct {
-    map: std.EnumArray(Id, u32) = .{
-        .invalid = 0,
-        .display = 1,
-    },
-    reg: std.ArrayList(Id) = .{},
+const Event = union(Id) {
+    invalid: enum {},
+    display: wl.display.ev,
+    callback: wl.callback.ev,
+    registry: wl.registry.ev,
+    compositor: wl.compositor.ev,
+    shm: wl.shm.ev,
+    wl_surface: wl.surface.ev,
+    shm_pool: wl.shm_pool.ev,
+    buffer: wl.buffer.ev,
+    wm_base: xdg.wm_base.ev,
+    xdg_surface: xdg.surface.ev,
+    toplevel: xdg.toplevel.ev,
+};
 
-    fn init(self: *@This(), allocator: std.mem.Allocator) void {
-        self.reg.initCapacity(allocator, 2);
-        self.reg.items = .{
+const Request = union(Id) {
+    invalid: enum {},
+    display: wl.display.op,
+    callback: wl.callback.op,
+    registry: wl.registry.op,
+    compositor: wl.compositor.op,
+    shm: wl.shm.op,
+    wl_surface: wl.surface.op,
+    shm_pool: wl.shm_pool.op,
+    buffer: wl.buffer.op,
+    wm_base: xdg.wm_base.op,
+    xdg_surface: xdg.surface.op,
+    toplevel: xdg.toplevel.op,
+};
+
+const Registry = struct {
+    reg: std.ArrayList(Id) = undefined,
+    del: std.ArrayList(u32) = undefined,
+    map: std.EnumArray(Id, u32) = undefined,
+    fn init(self: *@This(), allocator: std.mem.Allocator) !void {
+        self.reg = @TypeOf(self.reg).init(allocator);
+        try self.reg.appendSlice(&.{
             .invalid,
             .display,
-        };
+        });
+        self.map = @TypeOf(self.map).initDefault(0, .{
+            .display = 1,
+        });
+        self.del = @TypeOf(self.del).init(allocator);
+    }
+
+    fn deinit(self: *@This()) void {
+        self.reg.deinit();
     }
 
     fn next(self: *@This()) u32 {
+        if (self.del.items.len > 0) {
+            return self.del.items[0];
+        }
         return @intCast(self.reg.items.len);
     }
 
@@ -72,9 +111,25 @@ const Registry = struct {
         return .invalid;
     }
 
-    fn register(self: *@This(), id: Id) void {
-        _ = self;
-        _ = id;
+    fn register(self: *@This(), object: Id) !void {
+        const id = self.next();
+        self.map.set(object, self.next());
+        if (id < self.reg.items.len) {
+            self.reg.items[id] = object;
+            std.debug.assert(id == self.del.swapRemove(0));
+            return;
+        }
+        try self.reg.append(object);
+    }
+
+    fn deregister(self: *@This(), object: Id) !void {
+        std.log.debug("Deregistering {}", .{object});
+        const id = self.map.get(object);
+        if (id == 0) {
+            return;
+        }
+        try self.del.append(id);
+        self.map.set(object, 0);
     }
 
     fn getHeader(
@@ -90,7 +145,7 @@ const Registry = struct {
         const size = @sizeOf(Header) + bodysize;
         std.debug.assert(bodysize < std.math.maxInt(u16));
         return switch (tagged) {
-            .invalid => .{
+            .invalid, .callback => .{
                 .id = 0,
                 .code = 0,
                 .size = 0,
@@ -122,34 +177,6 @@ const Registry = struct {
     }
 };
 
-const Event = union(Id) {
-    invalid: enum {},
-    display: wl.display.ev,
-    registry: wl.registry.ev,
-    compositor: wl.compositor.ev,
-    shm: wl.shm.ev,
-    wl_surface: wl.surface.ev,
-    shm_pool: wl.shm_pool.ev,
-    buffer: wl.buffer.ev,
-    wm_base: xdg.wm_base.ev,
-    xdg_surface: xdg.surface.ev,
-    toplevel: xdg.toplevel.ev,
-};
-
-const Request = union(Id) {
-    invalid: enum {},
-    display: wl.display.op,
-    registry: wl.registry.op,
-    compositor: wl.compositor.op,
-    shm: wl.shm.op,
-    wl_surface: wl.surface.op,
-    shm_pool: wl.shm_pool.op,
-    buffer: wl.buffer.op,
-    wm_base: xdg.wm_base.op,
-    xdg_surface: xdg.surface.op,
-    toplevel: xdg.toplevel.op,
-};
-
 pub const Wayland = struct {
     allocator: std.mem.Allocator,
     socket: std.net.Stream,
@@ -166,7 +193,7 @@ pub const Wayland = struct {
         attached,
     },
 
-    pub fn init(self: *@This(), allocator: std.mem.Allocator) void {
+    pub fn init(self: *@This(), allocator: std.mem.Allocator) !void {
         self.allocator = allocator;
         self.offset = 0;
         self.w = 0;
@@ -174,6 +201,7 @@ pub const Wayland = struct {
         self.shm = null;
         self.pool = &.{};
         self.state = .none;
+        try self.registry.init(self.allocator);
     }
 
     pub fn deinit(self: *@This()) void {
@@ -182,6 +210,7 @@ pub const Wayland = struct {
             std.posix.munmap(self.pool);
             file.close();
         }
+        self.registry.deinit();
     }
 
     pub fn connect(self: *@This()) !void {
@@ -234,7 +263,22 @@ pub const Wayland = struct {
     }
 
     pub fn roundTrip(self: *@This()) !void {
-        _ = self;
+        try self.sendSync();
+        try self.waitCallback();
+    }
+
+    pub fn sendSync(self: *@This()) !void {
+        try self.send(
+            .{ .display = .sync },
+            std.mem.asBytes(&self.registry.next()),
+        );
+        try self.registry.register(.callback);
+    }
+
+    pub fn waitCallback(self: *@This()) !void {
+        while (self.registry.map.get(.callback) != 0) {
+            try self.recv();
+        }
     }
 
     pub fn recvAll(self: *@This()) !void {
@@ -276,12 +320,32 @@ pub const Wayland = struct {
         body: []u8,
     ) !void {
         switch (event) {
+            .invalid => std.log.debug("Invalid event received", .{}),
+            .compositor,
+            .shm_pool,
+            => std.log.debug("Handling empty event", .{}),
+            inline else => |tag, value| std.log.debug(
+                "Handling event {s} => {}",
+                .{ @tagName(tag), value },
+            ),
+        }
+        switch (event) {
+            .callback => |e| switch (e) {
+                .done => try self.registry.deregister(.callback),
+            },
             .display => |e| switch (e) {
+                .delete_id => {
+                    std.debug.assert(body.len == @sizeOf(u32));
+                    var bytes: [4]u8 = undefined;
+                    @memcpy(&bytes, body[0..4]);
+                    const id = std.mem.readInt(u32, &bytes, endian);
+                    const object = self.registry.reg.items[id];
+                    try self.registry.deregister(object);
+                },
                 .wl_error => {
                     _ = try parseError(body);
-                    std.process.exit(1);
+                    return error.WaylandError;
                 },
-                else => {},
             },
             .registry => |e| switch (e) {
                 .global => {
@@ -349,15 +413,16 @@ pub const Wayland = struct {
         std.debug.assert(data.len == interface_size + 16);
 
         try self.send(.{ .registry = wl.registry.op.bind }, data);
-        self.registry.register(object);
+        try self.registry.register(object);
     }
 
     pub fn getRegistry(self: *@This()) !void {
-        const id = self.registry.map.get(.registry);
+        const id = self.registry.next();
         try self.send(
             .{ .display = wl.display.op.get_registry },
             std.mem.asBytes(&id),
         );
+        try self.registry.register(.registry);
     }
 
     pub fn bindComplete(self: *@This()) bool {
@@ -373,13 +438,27 @@ pub const Wayland = struct {
     pub fn createSurface(self: *@This()) !void {
         try self.send(
             .{ .compositor = .create_surface },
-            std.mem.asBytes(&Id.wl_surface),
+            std.mem.asBytes(&self.registry.next()),
         );
+        try self.registry.register(.wl_surface);
 
         try self.send(
             .{ .wm_base = .get_xdg_surface },
-            std.mem.asBytes(&Id.xdg_surface),
+            std.mem.asBytes(&extern struct {
+                id: u32,
+                surface: u32,
+            }{
+                .id = self.registry.next(),
+                .surface = self.registry.map.get(.wl_surface),
+            }),
         );
+        try self.registry.register(.xdg_surface);
+
+        try self.send(
+            .{ .xdg_surface = .get_toplevel },
+            std.mem.asBytes(&self.registry.next()),
+        );
+        try self.registry.register(.toplevel);
     }
 
     pub fn createPool(self: *@This()) !void {

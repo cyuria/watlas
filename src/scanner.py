@@ -9,7 +9,7 @@ from subprocess import check_call
 from sys import argv
 from xml.etree import ElementTree as ET
 
-destination = Path("protocols")
+destination = Path(__file__).parent / "protocols"
 
 substitutions = {
     "error",
