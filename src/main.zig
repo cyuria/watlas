@@ -16,16 +16,20 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var window: wl.Wayland = undefined;
+    var window: wl.Wayland = .{};
     try window.init(gpa.allocator());
     defer window.deinit();
 
     window.w = 800;
     window.h = 600;
 
+    try window.createShm();
     try window.connect();
     try window.getRegistry();
-    try window.createShm();
+    try window.roundTrip();
+    if (!window.bindComplete()) {
+        std.log.debug("Bind Phase incomplete, waiting...", .{});
+    }
     while (!window.bindComplete()) {
         try window.recvAll();
     }
@@ -34,7 +38,6 @@ pub fn main() !void {
     try window.createSurface();
     std.log.debug("Surfaces created", .{});
     try window.roundTrip();
-    std.log.debug("Roundtrip Complete", .{});
 
     while (true) {
         try window.recv();

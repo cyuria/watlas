@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 const wl = @import("protocols/wayland.zig");
 const xdg = @import("protocols/xdg_shell.zig");
 
-const tmpfilebase = "/tmp/watlas";
+const tmpfilebase = "watlas-buffer";
 const endian = builtin.cpu.arch.endian();
 const format_xrgb8888: u32 = 1;
 const colour_channels: u32 = 4;
@@ -15,12 +15,16 @@ const Header = extern struct {
     size: u16 align(1),
 };
 
-const Cmsghdr = extern struct {
-    len: usize align(1),
-    level: i32 align(1),
-    type: i32 align(1),
-};
-const cmsghdr_space = roundup(@sizeOf(Cmsghdr), @sizeOf(usize));
+fn Cmsg(comptime T: type) type {
+    const padding_size = roundup(@sizeOf(T), @sizeOf(c_long));
+    return extern struct {
+        len: c_ulong = @sizeOf(@This()) - padding_size,
+        level: c_int,
+        type: c_int,
+        data: T,
+        _padding: [padding_size]u8 align(1) = [_]u8{0} ** padding_size,
+    };
+}
 
 const Id = enum {
     invalid,
@@ -87,6 +91,7 @@ const Registry = struct {
 
     fn deinit(self: *@This()) void {
         self.reg.deinit();
+        self.del.deinit();
     }
 
     fn next(self: *@This()) u32 {
@@ -120,6 +125,7 @@ const Registry = struct {
             return;
         }
         try self.reg.append(object);
+        std.log.debug("{}({}) registered", .{ object, id });
     }
 
     fn deregister(self: *@This(), object: Id) !void {
@@ -178,37 +184,32 @@ const Registry = struct {
 };
 
 pub const Wayland = struct {
-    allocator: std.mem.Allocator,
-    socket: std.net.Stream,
-    offset: u32,
-    w: u32,
-    h: u32,
-    shm: ?std.fs.File,
-    pool: []align(std.mem.page_size) u8,
-    registry: Registry,
+    allocator: std.mem.Allocator = undefined,
+    socket: std.net.Stream = undefined,
+    offset: u32 = 0,
+    w: u32 = 0,
+    h: u32 = 0,
+    shm: std.posix.fd_t = 0,
+    pool: []align(std.mem.page_size) u8 = &.{},
+    registry: Registry = .{},
+    callback: bool = false,
 
     state: enum {
         none,
         acked,
         attached,
-    },
+    } = .none,
 
     pub fn init(self: *@This(), allocator: std.mem.Allocator) !void {
         self.allocator = allocator;
-        self.offset = 0;
-        self.w = 0;
-        self.h = 0;
-        self.shm = null;
-        self.pool = &.{};
-        self.state = .none;
         try self.registry.init(self.allocator);
     }
 
     pub fn deinit(self: *@This()) void {
         self.socket.close();
-        if (self.shm) |file| {
+        if (self.shm != 0) {
+            std.posix.close(self.shm);
             std.posix.munmap(self.pool);
-            file.close();
         }
         self.registry.deinit();
     }
@@ -262,25 +263,6 @@ pub const Wayland = struct {
         try self.socket.writeAll(data);
     }
 
-    pub fn roundTrip(self: *@This()) !void {
-        try self.sendSync();
-        try self.waitCallback();
-    }
-
-    pub fn sendSync(self: *@This()) !void {
-        try self.send(
-            .{ .display = .sync },
-            std.mem.asBytes(&self.registry.next()),
-        );
-        try self.registry.register(.callback);
-    }
-
-    pub fn waitCallback(self: *@This()) !void {
-        while (self.registry.map.get(.callback) != 0) {
-            try self.recv();
-        }
-    }
-
     pub fn recvAll(self: *@This()) !void {
         var descriptor = [_]std.posix.pollfd{.{
             .revents = 0,
@@ -331,7 +313,7 @@ pub const Wayland = struct {
         }
         switch (event) {
             .callback => |e| switch (e) {
-                .done => try self.registry.deregister(.callback),
+                .done => self.callback = true,
             },
             .display => |e| switch (e) {
                 .delete_id => {
@@ -348,9 +330,7 @@ pub const Wayland = struct {
                 },
             },
             .registry => |e| switch (e) {
-                .global => {
-                    try self.registryBind(body);
-                },
+                .global => try self.registryBind(body),
                 else => {},
             },
             .wm_base => |e| switch (e) {
@@ -358,11 +338,12 @@ pub const Wayland = struct {
             },
             .xdg_surface => |e| switch (e) {
                 .configure => {
-                    try self.send(.{ .xdg_surface = .ack_configure }, &.{});
+                    try self.send(
+                        .{ .xdg_surface = .ack_configure },
+                        body,
+                    );
                     self.state = .acked;
-                    try self.createPool();
-                    try self.poolCreateBuffer();
-                    std.log.info("Pool Buffer Created", .{});
+                    try self.flip();
                 },
             },
             else => {},
@@ -416,6 +397,26 @@ pub const Wayland = struct {
         try self.registry.register(object);
     }
 
+    pub fn roundTrip(self: *@This()) !void {
+        try self.sendSync();
+        try self.waitCallback();
+    }
+
+    pub fn sendSync(self: *@This()) !void {
+        try self.send(
+            .{ .display = .sync },
+            std.mem.asBytes(&self.registry.next()),
+        );
+        try self.registry.register(.callback);
+    }
+
+    pub fn waitCallback(self: *@This()) !void {
+        while (!self.callback) {
+            try self.recv();
+        }
+        self.callback = false;
+    }
+
     pub fn getRegistry(self: *@This()) !void {
         const id = self.registry.next();
         try self.send(
@@ -459,72 +460,88 @@ pub const Wayland = struct {
             std.mem.asBytes(&self.registry.next()),
         );
         try self.registry.register(.toplevel);
+
+        try self.createPool();
+
+        try self.send(
+            .{ .shm_pool = .create_buffer },
+            std.mem.asBytes(&extern struct {
+                obj_id: u32,
+                offset: u32,
+                width: u32,
+                height: u32,
+                stride: u32,
+                format: u32,
+            }{
+                .obj_id = self.registry.next(),
+                .offset = self.offset,
+                .width = self.w,
+                .height = self.h,
+                .stride = self.w * 4,
+                .format = 0,
+            }),
+        );
+        try self.registry.register(.buffer);
+
+        try self.send(.{ .wl_surface = .commit }, &.{});
     }
 
     pub fn createPool(self: *@This()) !void {
-        std.debug.assert(self.pool.len > 0);
+        //std.debug.assert(self.pool.len > 0);
 
         const data: extern struct {
             header: Header align(1),
-            obj_id: u32 align(1),
-            pool_size: u32 align(1),
+            id: u32 align(1),
+            size: u32 align(1),
         } = .{
-            .header = .{
-                .id = @intFromEnum(Id.shm),
-                .code = @intFromEnum(wl.shm_pool.op.create_buffer),
-                .size = @sizeOf(Header) + 10,
-            },
-            .obj_id = @intFromEnum(Id.shm_pool),
-            .pool_size = @intCast(self.pool.len),
+            .header = self.registry.getHeader(
+                Request{ .shm = .create_pool },
+                8,
+            ),
+            .id = self.registry.next(),
+            .size = @intCast(self.pool.len),
         };
 
-        const io = std.posix.iovec_const{
+        std.debug.assert(data.header.size == @sizeOf(@TypeOf(data)));
+
+        const iov = std.posix.iovec_const{
             .base = std.mem.asBytes(&data),
             .len = @sizeOf(@TypeOf(data)),
         };
 
-        const body_size = comptime roundup(@sizeOf(@TypeOf(
-            self.shm.?.handle,
-        )), @sizeOf(usize));
-        const Cmsg = extern struct {
-            header: Cmsghdr align(1),
-            body: [body_size]u8 align(1),
+        var cmsg = Cmsg(@TypeOf(self.shm)){
+            .level = std.posix.SOL.SOCKET,
+            .type = 0x01,
+            .data = self.shm,
         };
-        var cmsg = Cmsg{
-            .header = .{
-                .level = std.posix.SOL.SOCKET,
-                .type = 0x01,
-                .len = cmsghdr_space + body_size,
-            },
-            .body = std.mem.zeroes([body_size]u8),
-        };
-        @memcpy(cmsg.body[0..4], std.mem.asBytes(&self.shm.?.handle));
+        const cmsg_bytes = std.mem.asBytes(&cmsg);
 
         const msghdr = std.posix.msghdr_const{
-            .iov = @ptrCast(&io),
-            .iovlen = 1,
-            .control = &cmsg,
-            .controllen = @sizeOf(Cmsg),
-            .flags = 0,
             .name = null,
             .namelen = 0,
+            .iov = @ptrCast(&iov),
+            .iovlen = 1,
+            .control = cmsg_bytes.ptr,
+            .controllen = cmsg_bytes.len,
+            .flags = 0,
         };
 
-        const result = try std.posix.sendmsg(
+        const bytes_sent = try std.posix.sendmsg(
             self.socket.handle,
             &msghdr,
             0,
         );
-        if (result == std.math.maxInt(@TypeOf(result))) {
+        if (bytes_sent != iov.len) {
             return error.SocketError;
         }
+        try self.registry.register(.shm_pool);
     }
 
     pub fn createShm(self: *@This()) !void {
-        if (self.shm) |old| {
-            old.close();
+        if (self.shm != 0) {
+            std.posix.close(self.shm);
             std.posix.munmap(self.pool);
-            self.shm = null;
+            self.shm = 0;
         }
 
         const size = self.w * self.h * colour_channels;
@@ -537,44 +554,33 @@ pub const Wayland = struct {
             std.time.microTimestamp(),
         });
         std.log.info("Using tmpfile {s} for shared memory", .{tmpfile});
-        const file = try std.fs.createFileAbsolute(tmpfile, .{
-            .read = true,
-            .truncate = true,
-            .exclusive = true,
-        });
-        try std.posix.unlink(tmpfile);
-        try std.posix.ftruncate(file.handle, size);
+        const file = try std.posix.memfd_create(tmpfile, 0);
+        try std.posix.ftruncate(file, size);
 
-        self.pool = try std.posix.mmap(
-            null,
-            size,
-            std.posix.PROT.READ | std.posix.PROT.WRITE,
-            .{ .TYPE = .SHARED },
-            file.handle,
-            0,
-        );
+        const prot = std.posix.PROT.READ | std.posix.PROT.WRITE;
+        const flags = std.posix.system.MAP{ .TYPE = .SHARED };
+        self.pool = try std.posix.mmap(null, size, prot, flags, file, 0);
         self.shm = file;
     }
 
-    fn poolCreateBuffer(self: *@This()) !void {
-        const data: extern struct {
-            obj_id: u32 align(1),
-            offset: u32 align(1),
-            width: u32 align(1),
-            height: u32 align(1),
-            stride: u32 align(1),
-        } = .{
-            .obj_id = @intFromEnum(Id.buffer),
-            .offset = self.offset,
-            .width = self.w,
-            .height = self.h,
-            .stride = self.w * 4,
-        };
+    pub fn flip(self: *@This()) !void {
+        // TODO: Draw here
+        @memset(self.pool, 0x80);
 
         try self.send(
-            .{ .shm_pool = .create_buffer },
-            std.mem.asBytes(&data),
+            .{ .wl_surface = .attach },
+            std.mem.asBytes(&extern struct {
+                buffer: u32,
+                x: u32,
+                y: u32,
+            }{
+                .buffer = self.registry.map.get(.buffer),
+                .x = 0,
+                .y = 0,
+            }),
         );
+        self.state = .attached;
+        try self.send(.{ .wl_surface = .commit }, &.{});
     }
 };
 
