@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const wl = @import("protocols/wayland.zig");
-const xdg = @import("protocols/xdg_shell.zig");
+const interfaces = @import("protocols/interfaces.zig");
+const wayland = @import("protocols/wayland.zig");
+const xdg_shell = @import("protocols/xdg_shell.zig");
 
 const tmpfilebase = "watlas-buffer";
 const endian = builtin.cpu.arch.endian();
@@ -50,79 +51,59 @@ fn Cmsg(comptime T: type) type {
     };
 }
 
-const Interface = enum {
-    invalid,
-    display,
-    registry,
-    compositor,
-    shm,
-    wl_surface,
-    shm_pool,
-    wm_base,
-    xdg_surface,
-    toplevel,
-    buffer,
-    callback,
+const Interface = struct {
+    i: interfaces,
 
-    const count = @intFromEnum(.callback) + 1;
-
-    fn get(interface: []u8) @This() {
-        const interfaces = [_]struct {
-            name: []const u8,
-            interface: Interface,
-        }{
-            .{ .name = "wl_compositor", .interface = .compositor },
-            .{ .name = "wl_shm", .interface = .shm },
-            .{ .name = "xdg_wm_base", .interface = .wm_base },
-        };
-        inline for (interfaces) |i|
-            if (std.mem.eql(u8, interface, i.name))
-                return i.interface;
+    fn get(interface: []u8) Interface {
+        //const interfaces = [_]struct {
+        //    name: []const u8,
+        //    interface: Interface,
+        //}{
+        //    .{ .name = "wl_compositor", .interface = .compositor },
+        //    .{ .name = "wl_shm", .interface = .shm },
+        //    .{ .name = "xdg_wm_base", .interface = .wm_base },
+        //};
+        //inline for (interfaces) |i|
+        //    if (std.mem.eql(u8, interface, i.name))
+        //        return i.interface;
+        std.log.debug("checking for interface {s}", .{interface});
+        inline for (std.meta.fields(wayland.wl)) |i| {
+            std.log.debug(
+                "checking {s} against {s}",
+                .{ interface, "wl_" ++ i.name },
+            );
+            if (std.mem.eql(u8, interface, "wl_" ++ i.name)) {
+                return .{ .wl = i };
+            }
+        }
         return .invalid;
     }
 };
 
-const Event = union(Interface) {
-    invalid: enum {},
-    display: wl.display.ev,
-    registry: wl.registry.ev,
-    compositor: wl.compositor.ev,
-    shm: wl.shm.ev,
-    wl_surface: wl.surface.ev,
-    shm_pool: wl.shm_pool.ev,
-    wm_base: xdg.wm_base.ev,
-    xdg_surface: xdg.surface.ev,
-    toplevel: xdg.toplevel.ev,
-    buffer: wl.buffer.ev,
-    callback: wl.callback.ev,
-};
-
-const Request = union(Interface) {
-    invalid: enum {},
-    display: wl.display.op,
-    registry: wl.registry.op,
-    compositor: wl.compositor.op,
-    shm: wl.shm.op,
-    wl_surface: wl.surface.op,
-    shm_pool: wl.shm_pool.op,
-    wm_base: xdg.wm_base.op,
-    xdg_surface: xdg.surface.op,
-    toplevel: xdg.toplevel.op,
-    buffer: wl.buffer.op,
-    callback: wl.callback.op,
-};
-
-const OpCode = union(enum) {
-    event: Event,
-    request: Request,
+const OpCode = extern union {
+    val: u16,
+    wl: wayland.wl,
+    xdg: xdg_shell.xdg,
 };
 
 const Message = struct {
     id: u32,
     op: OpCode,
 
+    fn init(
+        id: u32,
+        op: anytype,
+    ) switch (@TypeOf(op)) {
+        wayland.display.op,
+        wayland.display.ev,
+        => Header,
+        else => error.InvalidWaylandMessage,
+    } {
+        _ = id;
+    }
+
     fn getHeader(
-        self: *const @This(),
+        self: *const Message,
     ) !Header {
         return switch (self.op) {
             .event => |op| switch (op) {
@@ -151,71 +132,61 @@ const Message = struct {
 
     fn parseMessage(
         header: Header,
-        msgtype: @typeInfo(OpCode).Union.tag_type.?,
-        registry: Registry,
-    ) @This() {
+    ) Message {
         return .{
             .id = header.id,
-            .op = switch (msgtype) {
-                .event => .{ .event = switch (registry.reg.items[header.id]) {
-                    inline else => |tag| @unionInit(
-                        Event,
-                        @tagName(tag),
-                        @enumFromInt(header.code),
-                    ),
-                } },
-                .request => .{ .request = switch (registry.reg.items[header.id]) {
-                    inline else => |tag| @unionInit(
-                        Request,
-                        @tagName(tag),
-                        @enumFromInt(header.code),
-                    ),
-                } },
-            },
+            .op = .{ .val = header.code },
         };
     }
 };
 
 const Registry = struct {
+    allocator: std.mem.Allocator,
     reg: std.ArrayList(Interface),
     del: std.ArrayList(u32),
-    single: std.EnumArray(Interface, u32),
-    map: std.EnumArray(Interface, HashSet(u32)),
+    single: std.AutoHashMap(Interface, u32),
+    map: std.AutoHashMap(Interface, HashSet(u32)),
+    globals: std.AutoHashMap(Interface, u32),
 
     fn init(allocator: std.mem.Allocator) !Registry {
-        var self = .{
+        var self = Registry{
+            .allocator = allocator,
             .reg = std.ArrayList(Interface).init(allocator),
             .del = std.ArrayList(u32).init(allocator),
-            .single = std.EnumArray(Interface, u32).initDefault(0, .{
-                .display = 1,
-            }),
-            .map = std.EnumArray(Interface, HashSet(u32)).initFill(
-                HashSet(u32).init(allocator),
-            ),
+            .single = std.AutoHashMap(Interface, u32).init(allocator),
+            .map = std.AutoHashMap(Interface, HashSet(u32)).init(allocator),
+            .globals = std.AutoHashMap(Interface, u32).init(allocator),
         };
+        try self.single.put(.{ .wl = .display }, 1);
+        // .map = .initFill(
+        //     HashSet(u32).init(allocator),
+        // )
         try self.reg.appendSlice(&.{
-            .invalid,
-            .display,
+            .{ .invalid = .invalid },
+            .{ .wl = .display },
         });
         return self;
     }
 
-    fn deinit(self: *@This()) void {
+    fn deinit(self: *Registry) void {
         self.reg.deinit();
         self.del.deinit();
-        inline for (std.meta.fields(Interface)) |i| {
-            self.map.getPtr(@enumFromInt(i.value)).deinit();
+        self.single.deinit();
+        var map_it = self.map.valueIterator();
+        while (map_it.next()) |object| {
+            object.deinit();
         }
+        self.globals.deinit();
     }
 
-    fn next(self: *@This()) u32 {
+    fn next(self: *Registry) u32 {
         if (self.del.items.len > 0) {
             return self.del.items[0];
         }
         return @intCast(self.reg.items.len);
     }
 
-    fn register(self: *@This(), interface: Interface) !u32 {
+    fn bind(self: *Registry, interface: Interface) !u32 {
         const id = self.next();
         if (id < self.reg.items.len) {
             self.reg.items[id] = interface;
@@ -223,15 +194,19 @@ const Registry = struct {
         } else {
             try self.reg.append(interface);
         }
-        try self.map.getPtr(interface).putNoClobber(id, {});
-        self.single.set(interface, id);
+        const i = try self.map.getOrPutValue(
+            interface,
+            HashSet(u32).init(self.allocator),
+        );
+        try i.value_ptr.putNoClobber(id, {});
+        try self.single.put(interface, id);
         log.debug("{}({}) registered", .{ interface, id });
         return id;
     }
 
-    fn deregister(self: *@This(), object: u32) !void {
+    fn destroy(self: *Registry, object: u32) !void {
         const interface = self.reg.items[object];
-        log.debug("Deregistering {}[{}]", .{ object, interface });
+        log.debug("Destroying {}[{}]", .{ object, interface });
         if (interface == .invalid) {
             return;
         }
@@ -241,7 +216,12 @@ const Registry = struct {
         self.reg.items[object] = .invalid;
     }
 
-    fn getInterface(self: *@This(), id: u32) Interface {
+    fn global(self: *Registry, interface: Interface) void {
+        _ = self;
+        _ = interface;
+    }
+
+    fn getInterface(self: *Registry, id: u32) Interface {
         if (id >= self.reg.items.len)
             return .invalid;
         return self.reg.items[id];
@@ -329,26 +309,21 @@ pub const Client = struct {
 
     pub fn send(
         self: *Client,
-        id: u32,
-        code: Request,
-        msg: []const u8,
+        method: Message,
+        body: []const u8,
     ) !void {
-        std.debug.assert(msg.len % 4 == 0);
-        const size = @sizeOf(Header) + msg.len;
+        const size = @sizeOf(Header) + body.len;
+        std.debug.assert(size % 4 == 0);
         std.debug.assert(size < std.math.maxInt(u16));
 
-        std.debug.assert(id != 0);
+        std.debug.assert(method.id != 0);
 
-        const request = Message{
-            .id = id,
-            .op = .{ .request = code },
-        };
-        var header = try request.getHeader();
+        var header = try method.getHeader();
         header.size = @intCast(size);
 
         const data = try std.mem.concat(self.allocator, u8, &.{
             std.mem.asBytes(&header),
-            msg,
+            body,
         });
         defer self.allocator.free(data);
 
@@ -416,9 +391,7 @@ pub const Client = struct {
             .callback => |e| switch (e) {
                 .done => {
                     std.debug.assert(body.len == @sizeOf(u32));
-                    var bytes: [4]u8 = undefined;
-                    @memcpy(&bytes, body[0..4]);
-                    const data = std.mem.readInt(u32, &bytes, endian);
+                    const data = std.mem.readInt(u32, &body[0..4].*, endian);
                     self.setCallback(message.id, data) catch {
                         log.warn("Unknown Callback", .{});
                     };
@@ -427,10 +400,8 @@ pub const Client = struct {
             .display => |e| switch (e) {
                 .delete_id => {
                     std.debug.assert(body.len == @sizeOf(u32));
-                    var bytes: [4]u8 = undefined;
-                    @memcpy(&bytes, body[0..4]);
-                    const id = std.mem.readInt(u32, &bytes, endian);
-                    try self.registry.deregister(id);
+                    const id = std.mem.readInt(u32, &body[0..4].*, endian);
+                    try self.registry.destroy(id);
                 },
                 .wl_error => {
                     _ = try parseError(body);
@@ -483,8 +454,8 @@ pub const Client = struct {
             .{ interface.len, interface_len, interface_size, interface },
         );
 
-        const id = try self.registry.register(object);
-        errdefer self.registry.deregister(id) catch {};
+        const id = try self.registry.bind(object);
+        errdefer self.registry.destroy(id) catch {};
 
         const padding_size = interface_size - interface.len;
         std.debug.assert(padding_size < 4);
@@ -503,7 +474,7 @@ pub const Client = struct {
 
         try self.send(
             self.registry.single.get(.registry),
-            .{ .registry = wl.registry.op.bind },
+            .{ .registry = .bind },
             data,
         );
     }
@@ -574,8 +545,8 @@ pub const Client = struct {
     }
 
     pub fn sendSync(self: *Client) !u32 {
-        const callback = try self.registry.register(.callback);
-        errdefer self.registry.deregister(callback) catch {};
+        const callback = try self.registry.bind(.callback);
+        errdefer self.registry.destroy(callback) catch {};
 
         try self.send(
             self.registry.single.get(.display),
@@ -587,11 +558,13 @@ pub const Client = struct {
     }
 
     pub fn getRegistry(self: *Client) !void {
-        const registry = try self.registry.register(.registry);
-        errdefer self.registry.deregister(registry) catch {};
+        const registry = try self.registry.bind(.{ .wl = .registry });
+        errdefer self.registry.destroy(registry) catch {};
         try self.send(
-            self.registry.single.get(.display),
-            .{ .display = .get_registry },
+            .{
+                .id = self.registry.single.get(.{ .wl = .display }).?,
+                .op = .{ .val = @intFromEnum(wayland.display.op.get_registry) },
+            },
             std.mem.asBytes(&registry),
         );
     }
@@ -607,14 +580,16 @@ pub const Client = struct {
     }
 
     pub fn createSurface(self: *Client) !void {
+        const wl_surface = try self.registry.bind(.wl_surface);
+        errdefer self.registry.destroy(wl_surface) catch {};
         try self.send(
             self.registry.single.get(.compositor),
             .{ .compositor = .create_surface },
-            std.mem.asBytes(&try self.registry.register(.wl_surface)),
+            std.mem.asBytes(&wl_surface),
         );
 
-        const xdg_surface = try self.registry.register(.xdg_surface);
-        errdefer self.registry.deregister(xdg_surface) catch {};
+        const xdg_surface = try self.registry.bind(.xdg_surface);
+        errdefer self.registry.destroy(xdg_surface) catch {};
         try self.send(
             self.registry.single.get(.wm_base),
             .{ .wm_base = .get_xdg_surface },
@@ -627,8 +602,8 @@ pub const Client = struct {
             }),
         );
 
-        const toplevel = try self.registry.register(.toplevel);
-        errdefer self.registry.deregister(toplevel) catch {};
+        const toplevel = try self.registry.bind(.toplevel);
+        errdefer self.registry.destroy(toplevel) catch {};
         try self.send(
             self.registry.single.get(.xdg_surface),
             .{ .xdg_surface = .get_toplevel },
@@ -637,8 +612,8 @@ pub const Client = struct {
 
         try self.createPool();
 
-        const buffer = try self.registry.register(.buffer);
-        errdefer self.registry.deregister(buffer) catch {};
+        const buffer = try self.registry.bind(.buffer);
+        errdefer self.registry.destroy(buffer) catch {};
         try self.send(
             self.registry.single.get(.shm_pool),
             .{ .shm_pool = .create_buffer },
@@ -671,8 +646,8 @@ pub const Client = struct {
 
         log.debug("Creating shared memory pool", .{});
 
-        const shm_pool = try self.registry.register(.shm_pool);
-        errdefer self.registry.deregister(shm_pool) catch {};
+        const shm_pool = try self.registry.bind(.shm_pool);
+        errdefer self.registry.destroy(shm_pool) catch {};
         var data: extern struct {
             header: Header align(1),
             id: u32 align(1),
@@ -770,8 +745,8 @@ pub const Client = struct {
         const timestamp = self.state.frame_callback.data.?;
 
         log.debug("requesting new frame", .{});
-        const callback = try self.registry.register(.callback);
-        errdefer self.registry.deregister(callback) catch {};
+        const callback = try self.registry.bind(.callback);
+        errdefer self.registry.destroy(callback) catch {};
 
         self.state.frame_callback.* = .{ .id = callback, .data = null };
         try self.send(
@@ -831,9 +806,7 @@ fn parseError(body: []u8) !u32 {
 fn prettyBytes(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     const str = try allocator.alloc(u8, data.len * 2 + data.len / 4);
     for (0..data.len / 4) |i| {
-        var bytes: [4]u8 = undefined;
-        @memcpy(&bytes, data[4 * i .. 4 * (i + 1)]);
-        const n = std.mem.readInt(u32, &bytes, endian);
+        const n = std.mem.readInt(u32, &data[4 * i .. 4 * (i + 1)].*, endian);
         const offset = i * 9;
         _ = try std.fmt.bufPrint(
             str[offset..],

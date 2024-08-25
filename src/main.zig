@@ -21,7 +21,7 @@ pub fn logger(
 ) void {
     switch (scope) {
         .wayland => switch (level) {
-            .debug => return,
+            //.debug => return,
             else => {},
         },
         else => switch (level) {
