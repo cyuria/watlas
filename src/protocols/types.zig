@@ -8,6 +8,7 @@ pub const Array = extern struct {
 };
 
 pub const Interface = enum {
+    invalid,
     wl_display,
     wl_registry,
     wl_callback,

@@ -235,6 +235,7 @@ def main(args):
         f.write(zigFormat(f"""
             {definitions}
             pub const Interface = enum {{
+                invalid,
                 { '\n'.join(f'{i}, ' for i in interfaces) }
             }};
         """))

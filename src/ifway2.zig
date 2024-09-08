@@ -31,7 +31,10 @@ pub const Shell = struct {
             .socket = null,
             .shm = null,
             .objects = std.ArrayList(wltype.Interface).init(allocator),
-            .globals = std.AutoHashMap(wltype.Interface, Protocol).init(allocator),
+            .globals = std.AutoHashMap(wltype.Interface, struct {
+                Protocol,
+                ?u32,
+            }).init(allocator),
         };
     }
     pub fn deinit(self: *Shell) void {
@@ -42,6 +45,7 @@ pub const Shell = struct {
     }
 
     // Connects to the compositor. Call this first.
+    // This function handles the first burst round of globals.
     pub fn connect(self: *Shell) !void {
         if (std.posix.getenv("WAYLAND_SOCKET")) |socket| {
             self.socket = .{ .handle = try std.fmt.parseInt(
@@ -57,7 +61,7 @@ pub const Shell = struct {
         const path = if (display[0] == '/')
             std.mem.concat(self.allocator, u8, &.{
                 display,
-            }) catch unreachable
+            }) catch @panic("Out of memory")
         else
             std.mem.concat(self.allocator, u8, &.{
                 std.posix.getenv("XDG_RUNTIME_DIR") orelse {
@@ -65,12 +69,14 @@ pub const Shell = struct {
                 },
                 "/",
                 display,
-            }) catch unreachable;
+            }) catch @panic("Out of memory");
         defer self.allocator.free(path);
 
         log.info("Connecting to wayland on {s}", .{path});
         self.socket = try std.net.connectUnixSocket(path);
         self.shm = try createFile();
+
+        try self.send(1, wayland.display.request{ .get_registry = .{ .registry = 2 } });
     }
 
     // Flags for opening a window
@@ -87,23 +93,7 @@ pub const Shell = struct {
     ) Window {
         _ = dimensions;
         _ = flags;
-        const request = wayland.registry.request{
-            .bind = .{
-                .name = 21,
-                .interface = .{
-                    .ptr = "testing",
-                    .len = 8,
-                },
-                .version = 3,
-                .id = 9,
-            },
-        };
-        const tmp = serialiseRequest(
-            self.allocator,
-            request,
-        );
-        defer self.allocator.free(tmp);
-        std.log.debug("Packet: {X}", .{tmp});
+        // TODO: implement window opening functionality
 
         return Window.init(self, self.allocator, .{ 800, 600 });
     }
@@ -112,6 +102,121 @@ pub const Shell = struct {
         self: *Shell,
     ) void {
         _ = self;
+        // TODO: implement listener
+    }
+
+    fn send(
+        self: Shell,
+        object: u32,
+        request: anytype,
+    ) !void {
+        const opcode = @intFromEnum(request);
+        const body = serialiseRequest(self.allocator, request);
+        defer self.allocator.free(body);
+        std.debug.assert(8 + body.len <= std.math.maxInt(u16));
+        std.debug.assert(body.len % 4 == 0);
+        const header = extern struct {
+            object: u32,
+            code: u16,
+            size: u16,
+        }{
+            .object = object,
+            .code = opcode,
+            .size = @intCast(8 + body.len),
+        };
+        const packet = std.mem.concat(self.allocator, u8, &.{
+            std.mem.asBytes(&header),
+            body,
+        }) catch @panic("Out of memory");
+        defer self.allocator.free(packet);
+        std.debug.assert(packet.len == header.size);
+
+        log.debug("Sending packet [{}]: {X:0>8}", .{
+            packet.len,
+            std.mem.bytesAsSlice(u32, packet),
+        });
+        const size = try self.socket.?.write(packet);
+        std.debug.assert(size == packet.len);
+    }
+};
+
+const Registry = struct {
+    allocator: std.mem.Allocator,
+    objects: std.ArrayList(wltype.Interface),
+    freed: std.ArrayList(u32),
+    single: std.AutoHashMap(wltype.Interface, u32),
+    multi: std.EnumArray(wltype.Interface, std.ArrayList(u32)),
+    globals: std.AutoHashMap(wltype.Interface, Protocol),
+
+    fn init(allocator: std.mem.Allocator) Registry {
+        var self = Registry{
+            .allocator = allocator,
+            .objects = std.ArrayList(wltype.Interface).init(allocator),
+            .freed = std.ArrayList(u32).init(allocator),
+            .single = std.AutoHashMap(wltype.Interface, u32).init(allocator),
+            .multi = std.EnumArray(
+                wltype.Interface,
+                std.ArrayList(u32),
+            ).initFill(std.ArrayList(u32).init(allocator)),
+            .globals = std.AutoHashMap(wltype.Interface, Protocol).init(allocator),
+        };
+        self.objects.append(.invalid) catch @panic("Out of memory");
+        self.bind(.wl_display);
+        return self;
+    }
+
+    fn deinit(self: *Registry) void {
+        self.objects.deinit();
+        self.freed.deinit();
+        self.single.deinit();
+        self.globals.deinit();
+        for (self.multi) |*map| map.deinit();
+    }
+
+    fn next(self: *Registry) u32 {
+        if (self.del.items.len > 0) {
+            return self.del.items[0];
+        }
+        return @intCast(self.reg.items.len);
+    }
+
+    fn bind(self: *Registry, interface: wltype.Interface) u32 {
+        const id = self.next();
+        if (id < self.reg.items.len) {
+            self.objects.items[id] = interface;
+            std.debug.assert(id == self.freed.swapRemove(0));
+        } else {
+            self.objects.append(interface) catch @panic("Out of memory");
+        }
+
+        self.multi.getPtr(interface).putNoClobber(id, {}) catch unreachable;
+        self.single.put(interface, id) catch unreachable;
+
+        log.debug("{}({}) registered", .{ interface, id });
+        return id;
+    }
+
+    fn destroy(self: *Registry, object: u32) !void {
+        const interface = self.reg.items[object];
+        log.debug("Destroying {}[{}]", .{ object, interface });
+        if (interface == .invalid) {
+            return;
+        }
+        try self.del.append(object);
+        self.single.set(interface, 0);
+        _ = self.map.getPtr(interface).remove(object);
+        self.reg.items[object] = .invalid;
+    }
+
+    fn global(self: *Registry, interface: wltype.Interface) void {
+        _ = self;
+        _ = interface;
+    }
+
+    fn getInterface(self: *Registry, id: u32) wltype.Interface {
+        if (id >= self.reg.items.len)
+            return .invalid;
+        return self.reg.items[id];
     }
 };
 
