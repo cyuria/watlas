@@ -469,7 +469,7 @@ pub const FrameBuffer = struct {
 fn createEventHandlers(interface: wl.Interface) wl.Events {
     // Required for complex comptime syntax. Idk why backwards branching is
     // needed here, but it is.
-    @setEvalBranchQuota(972159);
+    @setEvalBranchQuota(2000000);
     return switch (interface) {
         inline else => |i| @unionInit(
             wl.Events,

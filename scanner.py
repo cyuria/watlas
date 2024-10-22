@@ -8,6 +8,7 @@ from pathlib import Path
 from subprocess import check_output
 from sys import argv
 from xml.etree import ElementTree as ET
+from re import match
 
 destination = Path(__file__).parent / "protocols"
 
@@ -19,6 +20,7 @@ substitutions = {
     "struct",
     "var",
     "type",
+    "test",
 }
 
 typesubstitutions = {
@@ -207,30 +209,18 @@ def protocol(root: ET.Element):
     """, namespace
 
 def find_protocols() -> list[Path]:
-    core = Path('/usr/share/wayland/wayland.xml')
-    protocols = Path('/usr/share/wayland-protocols/')
-    stable = protocols / 'stable'
-    staging = protocols / 'staging'
-    unstable = protocols / 'unstable'
-
-    if not core.exists():
-        raise Exception("No wayland core protocol file found, "
-            "try installing libwayland")
-    for dir in (protocols, stable, staging, unstable):
-        if not dir.is_dir():
-            raise Exception(f"No directory '{dir}' found")
-
-    names = set()
-    all = [core]
-
-    for dir in (stable, staging, unstable):
-        for protocol in dir.iterdir():
-            if protocol.name in names:
-                continue
-            names.add(protocol.name)
-            all += list(protocol.iterdir())
-
-    return all
+    base = Path.cwd() / 'thirdparty'
+    core = [base / 'wayland.xml']
+    stable = list(base.glob("**/stable/**/*.xml"))
+    staging = list(base.glob("**/staging/**/*.xml"))
+    unstable = list(base.glob("**/unstable/**/*.xml"))
+    # filter out stable protocols
+    def hasStableVersion(f: Path) -> bool:
+        unneeded = lambda part: match('^(unstable)|(v[0-9]+)$', part)
+        filtername = lambda name: '-'.join(part for part in name.split('-') if not unneeded(part))
+        return filtername(f.stem) in (filtername(s.stem) for s in stable)
+    unstable = [f for f in unstable if not hasStableVersion(f)]
+    return core + stable + unstable + staging
 
 def handler(f, n, i, t) -> str:
     name = i.removeprefix(f'{n}_') if n else i
