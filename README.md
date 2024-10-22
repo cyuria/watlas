@@ -10,7 +10,7 @@ configurable "buttons" and even arbitrary shell command execution.
 
 ### Requirements
 
-- The zig compiler (tested for at least v0.13.0)
+- The zig compiler (from master, i.e. at least v0.14.0)
 - Python (at least version 3.9)
 
 ### Building
