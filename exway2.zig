@@ -1,28 +1,33 @@
 const std = @import("std");
 
-const way2 = @import("src/ifway2.zig");
+const way2 = @import("src/way2.zig");
 const draw = @import("src/draw2.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 
-    var shell = way2.init(gpa.allocator());
-    defer shell.deinit();
+    var client = way2.Client.init(gpa.allocator());
+    try client.connect();
+    defer client.disconnect();
 
-    try shell.connect();
+    var window = try way2.Window.open(
+        &client,
+        .{ 800, 600 },
+        //.{ .CSD = true, .FLOATING = true },
+        .{},
+    );
+    defer window.close();
 
-    var window = shell.open(.{ 800, 600 }, .{ .CSD = true, .FLOATING = true });
-
-    draw.fill(window.surface, draw.white);
+    draw.fill(window.surface(), draw.white);
     draw.rectangle(
-        window.surface,
+        window.surface(),
         draw.blue,
         .{ 0, 0 }, // topleft corner
         .{ 500, 500 }, // bottom right corner
         .{}, // optional extra flags
     );
     draw.circle(
-        window.surface,
+        window.surface(),
         draw.red,
         .{ 400, 400 }, // centre
         50, // radius
@@ -34,5 +39,5 @@ pub fn main() !void {
     );
 
     window.present();
-    while (true) shell.listen();
+    while (true) try client.listen();
 }

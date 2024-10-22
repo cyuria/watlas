@@ -1,5 +1,5 @@
 const std = @import("std");
-const types = @import("types.zig");
+const types = @import("type2.zig");
 
 pub const red = types.Pixel{ .rgba = .{
     .r = 0xFF,
