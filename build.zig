@@ -20,8 +20,9 @@ pub fn build(b: *std.Build) !void {
     b.installArtifact(exe);
 
     const scanner_mtime = (try std.fs.cwd().statFile("scanner.py")).mtime;
+    const thirdparty_mtime = (try std.fs.cwd().statFile("thirdparty/")).mtime;
     const protocols_mtime = if (std.fs.cwd().statFile("protocols/")) |stat| stat.mtime else |_| 0;
-    if (scanner_mtime >= protocols_mtime) {
+    if (scanner_mtime >= protocols_mtime or thirdparty_mtime >= protocols_mtime) {
         exe.step.dependOn(&protocols.step);
     }
 
