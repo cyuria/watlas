@@ -53,24 +53,22 @@ fn shouldRegenerateProtocols() !bool {
     const cwd = std.fs.cwd();
 
     const scanner_mtime = (try cwd.statFile("scanner.py")).mtime;
-
-    var thirdparty = try cwd.openDir("thirdparty/", .{ .iterate = true });
-    defer thirdparty.close();
-    const thirdparty_mtime = try mtimeDir(thirdparty, .max);
-
-    var protocols = cwd.openDir("protocols/", .{ .iterate = true }) catch return true;
-    defer protocols.close();
-    const protocols_mtime = try mtimeDir(protocols, .min);
+    const thirdparty_mtime = try mtimeSubDir(cwd, "thirdparty/", .max);
+    const protocols_mtime = try mtimeSubDir(cwd, "protocols/", .min);
 
     return scanner_mtime >= protocols_mtime or thirdparty_mtime >= protocols_mtime;
 }
 
 const MTimeType = @TypeOf(@as(std.fs.File.Stat, undefined).mtime);
 
-fn mtimeDir(
-    directory: std.fs.Dir,
+fn mtimeSubDir(
+    parent: std.fs.Dir,
+    dirname: []const u8,
     direction: enum { min, max },
 ) !MTimeType {
+    var directory = try parent.openDir(dirname, .{ .iterate = true });
+    defer directory.close();
+
     var time: MTimeType = switch (direction) {
         .min => std.math.maxInt(MTimeType),
         .max => std.math.minInt(MTimeType),
@@ -78,17 +76,11 @@ fn mtimeDir(
 
     var it = directory.iterate();
     while (try it.next()) |entry| {
-        if (entry.kind == .directory) {
-            var newdir = try directory.openDir(entry.name, .{ .iterate = true });
-            defer newdir.close();
-            const mtime = try mtimeDir(newdir, direction);
-            if (switch (direction) {
-                .min => mtime < time,
-                .max => mtime > time,
-            }) time = mtime;
-        }
+        const mtime = if (entry.kind == .directory)
+            try mtimeSubDir(directory, entry.name, direction)
+        else
+            (try directory.statFile(entry.name)).mtime;
 
-        const mtime = (try directory.statFile(entry.name)).mtime;
         if (switch (direction) {
             .min => mtime < time,
             .max => mtime > time,
