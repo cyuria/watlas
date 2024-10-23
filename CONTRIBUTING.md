@@ -33,8 +33,8 @@ For the foreseeable future, Watlas will only support wayland. Why? Because I
 said so.
 
 That being said, if someone can replace all the functionality of `way2.zig`
-with something like `x2.zig`, then watlas can become just as viable on X11 as
-well.
+with something like `xorg2.zig`, then watlas can become just as viable on X11
+as well.
 
 The same goes for supporting other platforms and operating systems. Currently
 only x86_64 linux is supported, however if someone wants to ensure freeBSD
@@ -112,6 +112,11 @@ well as the event handling that comes with window management.
 
 Way2 should provide all the code required for opening a window, resizing it,
 handling events, etc and nothing more.
+
+Currently, all wayland events are handled via a table of pointers, assigned at
+runtime. This means wayland events may have a noticeable performance cost. It
+may be beneficial to also provide a static, comptime table for some events,
+such as registry globals.
 
 [^1]: There is also the `protocols/` directory and `src/scanner.py`.
 
