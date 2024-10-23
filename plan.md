@@ -35,6 +35,29 @@ Bind a new wayland object.
 
 Register an event handler with the receiver.
 
+### Index
+
+Part of the wayland client which is separated. Used for managing globals.
+
+#### Bind
+
+Bind a global
+
+#### Unbind
+
+Unbind a global
+
+#### Has
+
+Check for the existence of a global
+
+#### Get
+
+Get a global, returns an error if it doesn't exist.
+
+Probably don't bother calling `Index::Has()` and instead check for an error
+unless you're implementing a wait loop.
+
 ### Buffer
 
 A region of memory used for various buffer purposes.

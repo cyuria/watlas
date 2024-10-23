@@ -34,14 +34,8 @@ typesubstitutions = {
 }
 
 definitions = """
-pub const String = extern struct {
-    ptr: [*c]const u8,
-    len: u32,
-};
-pub const Array = extern struct {
-    ptr: [*c]const u32,
-    len: u32,
-};
+pub const String = [:0]u8;
+pub const Array = []u32;
 """
 
 def commonPrefix(strs: list[str]):
@@ -147,13 +141,13 @@ def interface(element: ET.Element, namespace: str) -> str:
                 ) }
             }};
 
-            pub const ev = union(event) {{
+            pub const ev = struct {{
                 { '\n'.join(
-                    f'{
+                    f'pub const {
                         rename(e.attrib['name'], namespace)
-                    }: {
+                    } = {
                         method(e)
-                    },'
+                    };'
                     for e in events
                 ) }
             }};
@@ -225,7 +219,7 @@ def find_protocols() -> list[Path]:
 def handler(f, n, i, t) -> str:
     name = i.removeprefix(f'{n}_') if n else i
     tp = f'{f}.{name}.{t}'
-    return f'std.EnumArray({tp}, ?*const fn (u32, {tp}, *anyopaque) void),'
+    return f'std.EnumArray({tp}, ?struct {{ context: *anyopaque, call: *const fn (*anyopaque, u32, {tp}, []const u8) void, }},),'
 
 def main(args):
     if not len(args):
@@ -255,7 +249,7 @@ def main(args):
             if i.tag == 'interface'
         ]
 
-    fnptr = '?*const fn (u32, enum {}, *anyopaque) void'
+    fnptr = '?struct { context: *anyopaque, call: *const fn (*anyopaque, u32, enum {}, []const u8) void, },'
     types = destination / 'types.zig'
     index = destination / 'proto.zig'
     with types.open('w') as f:

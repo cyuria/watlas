@@ -9,11 +9,6 @@ const dtype = @import("type2.zig");
 const wl = @import("../protocols/proto.zig");
 const wayland = @import("../protocols/wayland.zig");
 
-const Global = struct {
-    name: u32,
-    version: u32,
-};
-
 // The basic toplevel client data structure
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -22,7 +17,7 @@ pub const Client = struct {
     handlers: std.ArrayList(wl.Events),
     free: std.ArrayList(u32),
 
-    globals: std.ArrayList(Global),
+    globals: Index,
 
     pub fn init(allocator: std.mem.Allocator) Client {
         var self = Client{
@@ -30,7 +25,7 @@ pub const Client = struct {
             .socket = null,
             .handlers = std.ArrayList(wl.Events).init(allocator),
             .free = std.ArrayList(u32).init(allocator),
-            .globals = std.ArrayList(Global).init(allocator),
+            .globals = Index.init(allocator),
         };
         const inv = self.bind(.invalid);
         const dsp = self.bind(.wl_display);
@@ -109,11 +104,19 @@ pub const Client = struct {
         };
         errdefer if (self.socket) |s| s.close();
 
-        self.send(1, wayland.display.rq{ .get_registry = .{ .registry = 2 } }) catch {
+        const registry = 2;
+        self.send(1, wayland.display.rq{ .get_registry = .{ .registry = registry } }) catch {
             return error.WaylandConnectionError;
         };
 
-        // TODO: add default event handlers
+        self.handlers.items[registry].wl_registry.set(.global, .{
+            .context = &self.globals,
+            .call = @ptrCast(&Index.bind),
+        });
+        self.handlers.items[registry].wl_registry.set(.global_remove, .{
+            .context = &self.globals,
+            .call = @ptrCast(&Index.unbind),
+        });
     }
 
     pub fn disconnect(self: *Client) void {
@@ -322,9 +325,54 @@ pub const Client = struct {
 
                 const handler = handlers.get(@enumFromInt(header.opcode));
                 if (handler == null) break :blk;
-                handler.?(header.object, @enumFromInt(header.opcode), @ptrCast(body));
+                handler.?.call(handler.?.context, header.object, @enumFromInt(header.opcode), body);
             },
         }
+    }
+};
+
+pub const Index = struct {
+    const Global = struct {
+        name: u32,
+        interface: []u8,
+        version: u32,
+    };
+
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) Index {
+        return .{
+            .allocator = allocator,
+        };
+    }
+
+    pub fn bind(self: *Index, object: u32, opcode: wayland.registry.event, body: []u8) void {
+        // TODO: implement index bind()
+        _ = self;
+        _ = object;
+        _ = opcode;
+        const obj = deserialiseEvent(struct {
+            name: u32,
+            interface: wl.types.String,
+            version: u32,
+        }, body);
+        const interface: []u8 = std.mem.span(obj.interface.ptr);
+        std.debug.assert(interface.len < obj.interface.len);
+        log.debug("Found global interface {s}", .{interface});
+    }
+
+    pub fn unbind() void {
+        // TODO: implement index unbind()
+    }
+
+    pub fn has() bool {
+        // TODO: implement index has()
+        return false;
+    }
+
+    pub fn get() ?Global {
+        // TODO: implement index has()
+        return null;
     }
 };
 
@@ -540,10 +588,8 @@ fn mapShm(shm: std.posix.fd_t, size: usize) ![]align(std.mem.page_size) u8 {
     };
 }
 
-fn deserialiseEvent(allocator: std.mem.Allocator, request: anytype) []u8 {
-    switch (request) {
-        inline else => |payload| return deserialiseStruct(allocator, payload),
-    }
+fn deserialiseEvent(T: type, event: []u8) T {
+    return deserialiseStruct(T, event);
 }
 
 fn serialiseRequest(allocator: std.mem.Allocator, request: anytype) []u8 {
@@ -585,7 +631,6 @@ fn serialiseStruct(allocator: std.mem.Allocator, payload: anytype) []u8 {
 }
 // Deserialises a buffer into the provided type
 fn deserialiseStruct(T: type, buffer: []u8) T {
-    std.debug.assert(buffer.len == @sizeOf(T));
     var stream = std.io.fixedBufferStream(buffer);
     const reader = stream.reader();
     var args: T = undefined;
@@ -594,8 +639,9 @@ fn deserialiseStruct(T: type, buffer: []u8) T {
         switch (field.type) {
             wl.types.String, wl.types.Array => {
                 component.len = reader.readInt(u32, endian) catch unreachable;
-                component.ptr = @ptrCast(stream.ptr);
+                component.ptr = @ptrCast(&stream.buffer[stream.pos]);
                 stream.pos += component.len;
+                if (stream.pos >= stream.buffer.len) @panic("Invalid message received");
             },
             i32, u32 => component.* = reader.readInt(
                 field.type,
