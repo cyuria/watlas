@@ -65,13 +65,15 @@ fn shouldRegenerateProtocols() !bool {
     return scanner_mtime >= protocols_mtime or thirdparty_mtime >= protocols_mtime;
 }
 
+const MTimeType = @TypeOf(@as(std.fs.File.Stat, undefined).mtime);
+
 fn mtimeDir(
     directory: std.fs.Dir,
-    comptime direction: enum { min, max },
-) !i128 {
-    var time: i128 = switch (direction) {
-        .min => std.math.maxInt(i128),
-        .max => std.math.minInt(i128),
+    direction: enum { min, max },
+) !MTimeType {
+    var time: MTimeType = switch (direction) {
+        .min => std.math.maxInt(MTimeType),
+        .max => std.math.minInt(MTimeType),
     };
 
     var it = directory.iterate();
