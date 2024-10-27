@@ -49,14 +49,19 @@ Unbind a global
 
 #### Has
 
-Check for the existence of a global
+Use the following:
+
+```zig
+Index{}.objects.contains(interface);
+```
 
 #### Get
 
-Get a global, returns an error if it doesn't exist.
+Use the following:
 
-Probably don't bother calling `Index::Has()` and instead check for an error
-unless you're implementing a wait loop.
+```zig
+Index{}.objects.get(interface);
+```
 
 ### Buffer
 

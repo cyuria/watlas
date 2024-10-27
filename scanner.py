@@ -34,8 +34,8 @@ typesubstitutions = {
 }
 
 definitions = """
-pub const String = [:0]u8;
-pub const Array = []u32;
+pub const String = []const u8;
+pub const Array = []const u32;
 """
 
 def commonPrefix(strs: list[str]):
@@ -76,9 +76,7 @@ def argument(element: ET.Element) -> str:
 
 def method(element: ET.Element) -> str:
     args = [child for child in element if child.tag == 'arg']
-    if not args:
-        return 'void'
-    return f"""extern struct {{
+    return f"""struct {{
         {'\n'.join(argument(arg) for arg in args)}
     }}"""
 

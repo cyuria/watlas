@@ -18,6 +18,8 @@ pub fn main() !void {
     );
     defer window.close();
 
+    while (true) try client.listen();
+
     draw.fill(window.surface(), draw.white);
     draw.rectangle(
         window.surface(),
