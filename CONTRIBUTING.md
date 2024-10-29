@@ -10,6 +10,8 @@ You can:
 The rest of this document is effectively a braindump of design decisions made
 in the codebase.
 
+More stuff can be found under the [`docs/`](docs/) directory.
+
 ## Design Decisions
 
 This project will do its best to adhere to unix philosophy. Unfortunately, by
