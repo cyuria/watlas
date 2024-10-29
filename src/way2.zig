@@ -616,6 +616,7 @@ pub const Window = struct {
 
         switch (options.role) {
             .xdg => {
+                log.debug("binding xdg_wm_base", .{});
                 self.role.xdg.wm_base = self.client.bind(.xdg_wm_base);
                 errdefer {
                     self.client.invalidate(self.role.xdg.wm_base);
@@ -644,8 +645,8 @@ pub const Window = struct {
                     .context = self.client,
                     .call = @ptrCast(&pong),
                 });
-                try client.listen();
 
+                log.debug("binding xdg_surface", .{});
                 self.role.xdg.surface = self.client.bind(.xdg_surface);
                 try self.client.send(self.role.xdg.wm_base, xdg_shell.wm_base.rq{
                     .get_xdg_surface = .{
@@ -655,17 +656,28 @@ pub const Window = struct {
                 });
                 self.client.handlers.items[self.role.xdg.surface].xdg_surface.set(.configure, .{
                     .context = &self,
-                    .call = @ptrCast(&configureCommit),
+                    .call = @ptrCast(&xdgConfigure),
                 });
 
+                log.debug("binding xdg_toplevel", .{});
                 self.role.xdg.toplevel = self.client.bind(.xdg_toplevel);
                 try self.client.send(self.role.xdg.surface, xdg_shell.surface.rq{
                     .get_toplevel = .{ .id = self.role.xdg.toplevel },
                 });
-                //self.client.handlers.items[self.role.xdg.toplevel].xdg_toplevel.set(.configure, .{
-                //    .context = null,
-                //    .call = @ptrCast(null),
-                //});
+                self.client.handlers.items[self.role.xdg.toplevel].xdg_toplevel.set(.configure, .{
+                    .context = &self,
+                    .call = @ptrCast(&toplevelConfigure),
+                });
+                try self.client.send(self.role.xdg.toplevel, xdg_shell.toplevel.rq{
+                    .set_title = .{ .title = "hello, way2land" },
+                });
+
+                log.debug("committing wl_surface", .{});
+                try self.client.send(self.wl.surface, wayland.surface.rq{
+                    .commit = .{},
+                });
+
+                try client.listen();
             },
             else => return error.Unimplemented,
         }
@@ -714,7 +726,7 @@ pub const Window = struct {
     }
 
     /// Wayland event handler for the xdg_shell xdg_surface configure event
-    fn configureCommit(
+    fn xdgConfigure(
         self: *Window,
         object: u32,
         opcode: xdg_shell.surface.event,
@@ -724,6 +736,7 @@ pub const Window = struct {
         std.debug.assert(object == self.role.xdg.surface);
         const event = deserialiseStruct(xdg_shell.surface.ev.configure, body);
         _ = event;
+        log.debug("Configure event received", .{});
         // TODO: call ack_configure method
     }
 
@@ -736,8 +749,9 @@ pub const Window = struct {
         std.debug.assert(opcode == .configure);
         std.debug.assert(object == self.role.xdg.toplevel);
         const event = deserialiseStruct(xdg_shell.toplevel.ev.configure, body);
-        self.role.xdg.config.size[0] = event.width;
-        self.role.xdg.config.size[1] = event.height;
+        self.role.xdg.config.size[0] = @intCast(event.width);
+        self.role.xdg.config.size[1] = @intCast(event.height);
+        log.debug("Toplevel configure event received", .{});
     }
 };
 
@@ -852,7 +866,7 @@ fn serialiseStruct(allocator: std.mem.Allocator, payload: anytype) []u8 {
                 writer.writeByteNTimes(0, padding) catch @panic("Out of memory");
             },
             wl.types.Array => {
-                writer.writeInt(u32, @intCast(component.len), endian) catch @panic("Out of memory");
+                writer.writeInt(u32, @intCast(component.len * 4), endian) catch @panic("Out of memory");
                 writer.writeAll(std.mem.sliceAsBytes(component)) catch @panic("Out of memory");
             },
             i32, u32 => {
@@ -882,17 +896,19 @@ fn deserialiseStruct(T: type, buffer: []const u8) T {
                 const length = reader.readInt(u32, endian) catch unreachable;
                 const padding = (length + 3) / 4 * 4 - length;
                 component.len = length - 1; // account for null terminator
-                component.ptr = @ptrCast(&stream.buffer[stream.pos]);
+                component.ptr = stream.buffer[stream.pos..].ptr;
                 stream.pos += length;
                 stream.pos += padding;
-                if (stream.pos >= stream.buffer.len) @panic("Invalid message received");
+                if (stream.pos > stream.buffer.len) @panic("Invalid message received");
             },
             wl.types.Array => {
                 const length = reader.readInt(u32, endian) catch unreachable;
-                component.len = length;
-                component.ptr = @ptrCast(&stream.buffer[stream.pos]);
-                stream.pos += component.len;
-                if (stream.pos >= stream.buffer.len) @panic("Invalid message received");
+                component.* = @alignCast(std.mem.bytesAsSlice(
+                    u32,
+                    stream.buffer[stream.pos .. stream.pos + length],
+                ));
+                stream.pos += length;
+                if (stream.pos > stream.buffer.len) @panic("Invalid message received");
             },
             i32, u32 => component.* = reader.readInt(
                 field.type,
