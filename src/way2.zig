@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 const endian = builtin.cpu.arch.endian();
 const log = std.log.scoped(.way2);
 
-const dtype = @import("type2.zig");
+const type2 = @import("type2.zig");
 const wl = @import("../protocols/proto.zig");
 const wayland = @import("../protocols/wayland.zig");
 const xdg_shell = @import("../protocols/xdg_shell.zig");
@@ -177,7 +177,7 @@ pub const Client = struct {
             error.ConnectionPending,
             => |e| {
                 log.err("Cannot open Wayland Socket \"{s}\" - {}", .{ path, e });
-                return error.WaylandConnectionError;
+                return error.WaylandConnection;
             },
             error.SystemResources,
             => @panic("Out of system resources"),
@@ -194,7 +194,7 @@ pub const Client = struct {
         errdefer if (self.socket) |s| s.close();
 
         self.send(1, wayland.display.rq{ .get_registry = .{ .registry = wl_registry } }) catch {
-            return error.WaylandConnectionError;
+            return error.WaylandConnection;
         };
 
         // Register default handlers
@@ -215,8 +215,6 @@ pub const Client = struct {
             .context = self,
             .call = @ptrCast(&Client.unbind),
         });
-
-        try self.listen();
     }
 
     /// Close the wayland connection
@@ -236,7 +234,6 @@ pub const Client = struct {
         object: u32,
         request: anytype,
     ) !void {
-        const opcode = @intFromEnum(request);
         const body = switch (request) {
             inline else => |payload| serialiseStruct(self.allocator, payload),
         };
@@ -249,7 +246,7 @@ pub const Client = struct {
             size: u16,
         }{
             .object = object,
-            .code = opcode,
+            .code = @intFromEnum(request),
             .size = @intCast(8 + body.len),
         };
         const packet = std.mem.concat(self.allocator, u8, &.{
@@ -259,8 +256,7 @@ pub const Client = struct {
         defer self.allocator.free(packet);
         std.debug.assert(packet.len == header.size);
 
-        log.debug("Sending packet [{}]: {X:0>8}", .{
-            packet.len,
+        log.debug("Sending packet: {X:0>8}", .{
             std.mem.bytesAsSlice(u32, packet),
         });
         const size = self.socket.?.write(packet) catch |err| switch (err) {
@@ -271,7 +267,7 @@ pub const Client = struct {
             error.DeviceBusy,
             => |e| {
                 log.warn("IO error {}", .{e});
-                return e;
+                return error.WaylandConnection;
             },
             error.BrokenPipe,
             error.ConnectionResetByPeer,
@@ -284,7 +280,7 @@ pub const Client = struct {
             error.SystemResources,
             => @panic("Out of system resources"),
             error.Unexpected,
-            => @panic("Unexpected Error"),
+            => @panic("Unexpected error"),
             error.InvalidArgument,
             error.LockViolation,
             error.AccessDenied,
@@ -294,6 +290,97 @@ pub const Client = struct {
             => unreachable,
         };
         std.debug.assert(size == packet.len);
+    }
+
+    /// Send a wayland message with an attached file descripter
+    pub fn sendFd(
+        self: *Client,
+        object: u32,
+        request: anytype,
+        fd: std.posix.fd_t,
+    ) !void {
+        const body = switch (request) {
+            inline else => |payload| serialiseStruct(self.allocator, payload),
+        };
+        defer self.allocator.free(body);
+        std.debug.assert(8 + body.len <= std.math.maxInt(u16));
+        std.debug.assert(body.len % 4 == 0);
+        const header = extern struct {
+            object: u32,
+            code: u16,
+            size: u16,
+        }{
+            .object = object,
+            .code = @intFromEnum(request),
+            .size = @intCast(8 + body.len),
+        };
+        const packet = std.mem.concat(self.allocator, u8, &.{
+            std.mem.asBytes(&header),
+            body,
+        }) catch @panic("Out of memory");
+        defer self.allocator.free(packet);
+
+        const iov = std.posix.iovec_const{
+            .base = packet.ptr,
+            .len = packet.len,
+        };
+
+        const cmsg = std.mem.asBytes(&Cmsg(@TypeOf(fd)){
+            .level = std.posix.SOL.SOCKET,
+            .type = 0x01,
+            .data = fd,
+        });
+
+        const msghdr = std.posix.msghdr_const{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&iov),
+            .iovlen = 1,
+            .control = cmsg.ptr,
+            .controllen = cmsg.len,
+            .flags = 0,
+        };
+
+        log.debug("Sending packet with fd {}: {X:0>8}", .{
+            fd,
+            std.mem.bytesAsSlice(u32, packet),
+        });
+        const bytes_sent = std.posix.sendmsg(
+            self.socket.?.handle,
+            &msghdr,
+            0,
+        ) catch |err| switch (err) {
+            error.ConnectionResetByPeer,
+            error.BrokenPipe,
+            error.NetworkUnreachable,
+            error.NetworkSubsystemFailed,
+            error.SocketNotConnected,
+            => |e| {
+                log.warn("Wayland disconnected after error {}", .{e});
+                self.disconnect();
+                return error.WaylandDisconnected;
+            },
+            error.SystemResources,
+            => @panic("Out of system resources"),
+            error.Unexpected,
+            => @panic("Unexpected error"),
+            error.AccessDenied,
+            error.FastOpenAlreadyInProgress,
+            error.MessageTooBig,
+            error.FileDescriptorNotASocket,
+            error.SymLinkLoop,
+            error.AddressFamilyNotSupported,
+            error.NameTooLong,
+            error.FileNotFound,
+            error.NotDir,
+            error.AddressNotAvailable,
+            error.WouldBlock,
+            => unreachable,
+        };
+        if (bytes_sent != iov.len) {
+            log.err("Unable to send bytes to wayland compositor", .{});
+            return error.WaylandConnection;
+        }
     }
 
     /// Waits for, receives and handles a single wayland event
@@ -306,9 +393,9 @@ pub const Client = struct {
             size: u16,
         }) catch |err| switch (err) {
             error.InputOutput,
-            => |e| {
-                log.warn("IO error", .{});
-                return e;
+            => {
+                log.err("IO error", .{});
+                return error.WaylandConnection;
             },
             error.OperationAborted,
             error.BrokenPipe,
@@ -341,9 +428,9 @@ pub const Client = struct {
         defer self.allocator.free(body);
         const size = reader.read(body) catch |err| switch (err) {
             error.InputOutput,
-            => |e| {
-                log.warn("received {}", .{e});
-                return e;
+            => {
+                log.err("IO error", .{});
+                return error.WaylandConnection;
             },
             error.OperationAborted,
             error.BrokenPipe,
@@ -375,6 +462,7 @@ pub const Client = struct {
         // Call the respective event handler
         // This is quite convoluted due to type requirements
         switch (self.handlers.items[header.object]) {
+            .invalid => {},
             inline else => |handlers| blk: {
                 // If this is true then @enumFromInt would panic anyway
                 // Also handles empty event cases
@@ -382,6 +470,7 @@ pub const Client = struct {
 
                 const handler = handlers.get(@enumFromInt(header.opcode));
                 if (handler == null) break :blk;
+
                 handler.?.call(handler.?.context, header.object, @enumFromInt(header.opcode), body);
             },
         }
@@ -434,7 +523,7 @@ pub const Client = struct {
     /// future use
     pub fn invalidate(self: *Client, object: u32) void {
         const interface = self.handlers.items[object];
-        log.debug("Invalidating {}[{}]", .{ object, interface });
+        log.debug("Invalidating {}[{s}]", .{ object, @tagName(interface) });
         if (interface == .invalid) {
             log.warn("Attempted to invalidate invalid object", .{});
             return;
@@ -489,18 +578,18 @@ pub const Client = struct {
 
 /// Manages a user facing window. Requires a connected wayland `Client`
 pub const Window = struct {
-    pub const Frame = struct {
+    pub const FrameBuffer = struct {
         buf: *Buffer,
-        surface: dtype.Surface,
+        surface: type2.Surface,
 
-        pub fn init(buf: *Buffer, offset: u32, width: u32, height: u32) Frame {
+        pub fn init(buf: *Buffer, offset: u32, width: u32, height: u32) FrameBuffer {
             // Round up if the alignment isn't ideal
-            const off = offset / @sizeOf(dtype.Pixel);
-            const self = Frame{
+            const off = offset / @sizeOf(type2.Pixel);
+            const self = FrameBuffer{
                 .buf = buf,
                 .surface = .{
                     .buffer = std.mem.bytesAsSlice(
-                        dtype.Pixel,
+                        type2.Pixel,
                         buf.pool,
                     )[off .. off + width * height],
                     .width = width,
@@ -512,25 +601,44 @@ pub const Window = struct {
         }
     };
 
+    const FrameTime = struct {
+        done: bool = false,
+        time: u32 = undefined,
+        fn ready(
+            self: *FrameTime,
+            _: u32,
+            opcode: wayland.callback.event,
+            body: []const u8,
+        ) void {
+            std.debug.assert(opcode == .done);
+            const event = deserialiseStruct(wayland.callback.ev.done, body);
+            self.time = event.callback_data;
+            self.done = true;
+        }
+    };
+
     client: *Client,
     role: union(enum) {
         xdg: struct {
-            wm_base: u32,
-            surface: u32,
-            toplevel: u32,
-            config: struct {
-                size: @Vector(2, u32),
-            },
+            wm_base: u32 = 0,
+            surface: u32 = 0,
+            toplevel: u32 = 0,
         },
-    },
+    } = .{ .xdg = .{} },
     wl: struct {
-        surface: u32,
-        compositor: u32,
-    },
-    buffer: Buffer,
-    frame: Frame,
-    pixels: *dtype.Surface,
-    size: @Vector(2, u32),
+        surface: u32 = 0,
+        compositor: u32 = 0,
+        shm: u32 = 0,
+        pool: u32 = 0,
+        buffer: u32 = 0,
+        frame_callback: u32 = 0,
+    } = .{},
+    buffer: Buffer = undefined,
+    frame: struct {
+        buffer: FrameBuffer = undefined,
+        time: FrameTime = .{},
+    } = .{},
+    size: @Vector(2, u32) = undefined,
 
     /// Flags for opening a window based on a given shell protocol
     const OpenFlags = struct {
@@ -542,10 +650,10 @@ pub const Window = struct {
                 max_size: ?@Vector(2, u32) = null,
                 decorations: enum { clientside, serverside } = .clientside,
             },
-            layer: struct {
+            wlr_layer: struct {
                 layer: enum { background, bottom, top, overlay } = .top,
                 margin: ?struct { top: u32 = 0, right: u32 = 0, bottom: u32 = 0, left: u32 = 0 } = null,
-                keyboard_interactivity: ?void,
+                keyboard_interactivity: bool = true,
             },
             fullscreen: struct {},
             // plasma: struct {}, // TODO: add support for org_kde_plasma_shell
@@ -557,40 +665,30 @@ pub const Window = struct {
         } = .{ .xdg = .{} },
     };
 
+    pub fn init(
+        client: *Client,
+    ) Window {
+        return .{ .client = client };
+    }
+
     /// Opens a new wayland window
     pub fn open(
-        client: *Client,
+        self: *Window,
         size: @Vector(2, u32),
         options: OpenFlags,
-    ) !Window {
-        // TODO: implement Window.open()
-        var self = Window{
-            .client = client,
-            .role = .{ .xdg = .{
-                .wm_base = 0,
-                .surface = 0,
-                .toplevel = 0,
-                .config = .{
-                    .size = size,
-                },
-            } },
-            .wl = .{
-                .surface = 0,
-                .compositor = 0,
-            },
-            .buffer = undefined,
-            .frame = undefined,
-            .pixels = undefined,
-            .size = size,
-        };
+    ) !void {
+        self.size = size;
+        self.buffer = try Buffer.init(@sizeOf(type2.Pixel));
+        self.frame.buffer = FrameBuffer.init(&self.buffer, 0, 1, 1);
 
-        while (!client.globals.objects.contains("wl_compositor")) {
-            try client.listen();
+        while (!self.client.globals.objects.contains("wl_compositor")) {
+            try self.client.listen();
         }
 
-        self.wl.compositor = client.bind(.wl_compositor);
+        log.debug("binding wl_compositor", .{});
+        self.wl.compositor = self.client.bind(.wl_compositor);
         const wl_compositor = self.client.globals.objects.get("wl_compositor").?;
-        self.client.send(2, wayland.registry.rq{ .bind = .{
+        self.client.send(Client.wl_registry, wayland.registry.rq{ .bind = .{
             .id = self.wl.compositor,
             .name = wl_compositor.name,
             .version = wl_compositor.version,
@@ -600,15 +698,16 @@ pub const Window = struct {
             self.client.free.append(self.wl.compositor) catch |err| {
                 log.err("Error received while cleaning up {}", .{err});
             };
-            self.role.xdg.wm_base = 0;
+            self.wl.compositor = 0;
         };
 
-        self.wl.surface = client.bind(.wl_surface);
+        log.debug("creating wl_surface", .{});
+        self.wl.surface = self.client.bind(.wl_surface);
         try self.client.send(self.wl.compositor, wayland.compositor.rq{ .create_surface = .{
             .id = self.wl.surface,
         } });
         errdefer {
-            client.invalidate(self.wl.surface);
+            self.client.invalidate(self.wl.surface);
             self.client.send(self.wl.surface, wayland.surface.rq{ .destroy = .{} }) catch |err| {
                 log.err("Error received while cleaning up {}", .{err});
             };
@@ -655,7 +754,7 @@ pub const Window = struct {
                     },
                 });
                 self.client.handlers.items[self.role.xdg.surface].xdg_surface.set(.configure, .{
-                    .context = &self,
+                    .context = self,
                     .call = @ptrCast(&xdgConfigure),
                 });
 
@@ -665,23 +764,59 @@ pub const Window = struct {
                     .get_toplevel = .{ .id = self.role.xdg.toplevel },
                 });
                 self.client.handlers.items[self.role.xdg.toplevel].xdg_toplevel.set(.configure, .{
-                    .context = &self,
+                    .context = self,
                     .call = @ptrCast(&toplevelConfigure),
                 });
                 try self.client.send(self.role.xdg.toplevel, xdg_shell.toplevel.rq{
                     .set_title = .{ .title = "hello, way2land" },
                 });
 
-                log.debug("committing wl_surface", .{});
-                try self.client.send(self.wl.surface, wayland.surface.rq{
-                    .commit = .{},
-                });
-
-                try client.listen();
+                try self.client.listen();
             },
             else => return error.Unimplemented,
         }
-        return self;
+
+        log.debug("committing wl_surface", .{});
+        try self.client.send(self.wl.surface, wayland.surface.rq{
+            .commit = .{},
+        });
+
+        log.debug("binding wl_shm", .{});
+        self.wl.shm = self.client.bind(.wl_shm);
+        const wl_shm = self.client.globals.objects.get("wl_shm") orelse {
+            return error.UnsupportedCompositor;
+        };
+        try self.client.send(Client.wl_registry, wayland.registry.rq{ .bind = .{
+            .id = self.wl.shm,
+            .name = wl_shm.name,
+            .version = wl_shm.version,
+            .interface = wl_shm.string,
+        } });
+
+        log.debug("creating wl_shm_pool", .{});
+        self.wl.pool = self.client.bind(.wl_shm_pool);
+        self.client.sendFd(self.wl.shm, wayland.shm.rq{ .create_pool = .{
+            .id = self.wl.pool,
+            .size = @intCast(self.buffer.pool.len),
+        } }, self.buffer.shm) catch log.err("Unrecoverable Wayland Connection Error", .{});
+
+        log.debug("creating wl_buffer", .{});
+        self.wl.buffer = self.client.bind(.wl_buffer);
+        try self.client.send(self.wl.pool, wayland.shm_pool.rq{ .create_buffer = .{
+            .id = self.wl.buffer,
+            .offset = 0,
+            .width = 1,
+            .height = 1,
+            .stride = @sizeOf(type2.Pixel),
+            .format = @intFromEnum(wayland.shm.format.argb8888),
+        } });
+        // TODO: correctly handle the wl_buffer::release event
+        // self.client.handlers.items[self.wl.buffer].wl_buffer.set(.release, .{
+        //     .context = null,
+        //     .call = @ptrCast(),
+        // });
+
+        try self.newFrame();
     }
 
     /// Closes a wayland window
@@ -700,14 +835,47 @@ pub const Window = struct {
     }
 
     pub fn present(
-        self: Window,
-    ) void {
-        // TODO: implement Window.present()
-        _ = self;
+        self: *Window,
+    ) !void {
+        while (!self.frame.time.done) {
+            std.time.sleep(1000);
+            try self.client.listen();
+        }
+
+        self.client.invalidate(self.wl.frame_callback);
+        try self.newFrame();
+
+        try self.client.send(self.wl.surface, wayland.surface.rq{
+            .attach = .{ .buffer = self.wl.buffer, .x = 0, .y = 0 },
+        });
+        try self.client.send(self.wl.surface, wayland.surface.rq{
+            .damage = .{
+                .x = 0,
+                .y = 0,
+                .width = @intCast(self.frame.buffer.surface.width),
+                .height = @intCast(self.frame.buffer.surface.height),
+            },
+        });
+        try self.client.send(self.wl.surface, wayland.surface.rq{
+            .commit = .{},
+        });
     }
 
-    pub fn surface(self: Window) dtype.Surface {
-        return self.frame.surface;
+    pub fn surface(self: Window) type2.Surface {
+        return self.frame.buffer.surface;
+    }
+
+    fn newFrame(self: *Window) !void {
+        self.frame.time.done = false;
+        self.wl.frame_callback = self.client.bind(.wl_callback);
+        try self.client.send(self.wl.surface, wayland.surface.rq{
+            .frame = .{ .callback = self.wl.frame_callback },
+        });
+        self.client.handlers.items[self.wl.frame_callback].wl_callback.set(.done, .{
+            .context = &self.frame.time,
+            .call = @ptrCast(&FrameTime.ready),
+        });
+        try self.client.listen();
     }
 
     /// Wayland event handler for the xdg_shell wm_base pong event
@@ -716,7 +884,7 @@ pub const Window = struct {
         object: u32,
         opcode: xdg_shell.wm_base.event,
         body: []const u8,
-    ) !void {
+    ) void {
         std.debug.assert(opcode == .ping);
         log.debug("pong!", .{});
         const ping = deserialiseStruct(xdg_shell.wm_base.ev.ping, body);
@@ -735,9 +903,48 @@ pub const Window = struct {
         std.debug.assert(opcode == .configure);
         std.debug.assert(object == self.role.xdg.surface);
         const event = deserialiseStruct(xdg_shell.surface.ev.configure, body);
-        _ = event;
-        log.debug("Configure event received", .{});
-        // TODO: call ack_configure method
+        log.debug("configure event received", .{});
+        self.buffer.resize(self.size[0] * self.size[1] * @sizeOf(type2.Pixel)) catch {
+            log.err("unrecoverable IO error encountered", .{});
+        };
+        self.frame.buffer = FrameBuffer.init(&self.buffer, 0, self.size[0], self.size[1]);
+        self.client.invalidate(self.wl.frame_callback);
+        self.newFrame() catch log.err("unrecoverable wayland connection error", .{});
+
+        self.client.send(self.wl.pool, wayland.shm_pool.rq{
+            .resize = .{ .size = @intCast(self.buffer.pool.len) },
+        }) catch log.err("unrecoverable wayland connection error", .{});
+
+        self.client.send(self.wl.buffer, wayland.buffer.rq{ .destroy = .{} }) catch {
+            log.err("unrecoverable wayland connection error", .{});
+        };
+        self.client.invalidate(self.wl.buffer);
+
+        log.debug("creating wl_buffer", .{});
+        self.wl.buffer = self.client.bind(.wl_buffer);
+        self.client.send(self.wl.pool, wayland.shm_pool.rq{ .create_buffer = .{
+            .id = self.wl.buffer,
+            .offset = 0,
+            .width = @intCast(self.frame.buffer.surface.width),
+            .height = @intCast(self.frame.buffer.surface.height),
+            .stride = @intCast(@sizeOf(type2.Pixel) * self.frame.buffer.surface.width),
+            .format = @intFromEnum(wayland.shm.format.argb8888),
+        } }) catch log.err("unrecoverable wayland connection error", .{});
+
+        log.debug("attaching wl_buffer to wl_surface", .{});
+        self.client.send(self.wl.surface, wayland.surface.rq{
+            .attach = .{ .buffer = self.wl.buffer, .x = 0, .y = 0 },
+        }) catch log.err("unrecoverable wayland connection error", .{});
+
+        log.debug("acknowledging xdg_surface configure event", .{});
+        self.client.send(self.role.xdg.surface, xdg_shell.surface.rq{
+            .ack_configure = .{ .serial = event.serial },
+        }) catch log.err("unrecoverable wayland connection error", .{});
+
+        self.client.send(
+            self.wl.surface,
+            wayland.surface.rq{ .commit = .{} },
+        ) catch log.err("unrecoverable Wayland Connection Error", .{});
     }
 
     fn toplevelConfigure(
@@ -749,9 +956,12 @@ pub const Window = struct {
         std.debug.assert(opcode == .configure);
         std.debug.assert(object == self.role.xdg.toplevel);
         const event = deserialiseStruct(xdg_shell.toplevel.ev.configure, body);
-        self.role.xdg.config.size[0] = @intCast(event.width);
-        self.role.xdg.config.size[1] = @intCast(event.height);
+        if (event.width != 0)
+            self.size[0] = @intCast(event.width);
+        if (event.height != 0)
+            self.size[1] = @intCast(event.height);
         log.debug("Toplevel configure event received", .{});
+        log.debug("new size width {} height {}", .{ self.size[0], self.size[1] });
     }
 };
 
@@ -768,7 +978,7 @@ pub const Buffer = struct {
     }
 
     pub fn deinit(self: *Buffer) void {
-        std.posix.munmap(self.pool);
+        if (self.pool.len > 0) std.posix.munmap(self.pool);
         std.posix.close(self.shm);
     }
 
@@ -810,7 +1020,7 @@ pub const Buffer = struct {
 
     /// Resize and memory map a file descriptor for shared memory
     fn mapShm(shm: std.posix.fd_t, size: usize) ![]align(std.mem.page_size) u8 {
-        std.debug.assert(size > 0);
+        std.debug.assert(size != 0);
         std.posix.ftruncate(shm, size) catch |err| switch (err) {
             error.InputOutput,
             => |e| {
@@ -825,9 +1035,14 @@ pub const Buffer = struct {
             error.AccessDenied,
             => unreachable,
         };
-        const prot = std.posix.PROT.READ | std.posix.PROT.WRITE;
-        const flags = .{ .TYPE = .SHARED };
-        return std.posix.mmap(null, size, prot, flags, shm, 0) catch |err| switch (err) {
+        return std.posix.mmap(
+            null,
+            size,
+            std.posix.PROT.READ | std.posix.PROT.WRITE,
+            .{ .TYPE = .SHARED },
+            shm,
+            0,
+        ) catch |err| switch (err) {
             error.ProcessFdQuotaExceeded,
             error.SystemFdQuotaExceeded,
             => |e| return e,
@@ -844,11 +1059,28 @@ pub const Buffer = struct {
         };
     }
 
-    fn resize(self: *Buffer, size: usize) !void {
+    pub fn resize(self: *Buffer, size: usize) !void {
         std.posix.munmap(self.pool);
-        self.pool = try mapShm(self.shm, size);
+        self.pool = mapShm(self.shm, size) catch |err| switch (err) {
+            error.InputOutput,
+            => |e| return e,
+            error.SystemFdQuotaExceeded,
+            error.ProcessFdQuotaExceeded,
+            => unreachable,
+        };
     }
 };
+
+fn Cmsg(comptime T: type) type {
+    const padding_size = (@sizeOf(T) + @sizeOf(c_long) - 1) / @sizeOf(c_long) * @sizeOf(c_long);
+    return extern struct {
+        len: c_ulong = @sizeOf(@This()) - padding_size,
+        level: c_int,
+        type: c_int,
+        data: T,
+        _padding: [padding_size]u8 align(1) = [_]u8{0} ** padding_size,
+    };
+}
 
 /// Serialises a struct into a buffer
 fn serialiseStruct(allocator: std.mem.Allocator, payload: anytype) []u8 {
