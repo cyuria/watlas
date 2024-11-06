@@ -4,6 +4,7 @@
 A python script to enumerate wayland protocol requests and events
 """
 
+from math import log2
 from pathlib import Path
 from subprocess import check_output
 from sys import argv
@@ -11,6 +12,11 @@ from xml.etree import ElementTree as ET
 from re import match
 
 destination = Path(__file__).parent / "protocols"
+
+deprecated = [
+    "wl_shell",
+    "wl_shell_surface",
+]
 
 substitutions = {
     "async",
@@ -85,7 +91,38 @@ def enumEntry(element: ET.Element, namespace) -> str:
     value = element.attrib['value']
     return f"{name} = {value},"
 
+def bitfield(element: ET.Element, namespace) -> str:
+    entries = [child for child in element if child.tag == 'entry']
+    entries.sort(key = lambda e: int(e.attrib['value'], 0))
+    lines = []
+    prev = 0.5
+    for e in entries:
+        value = int(e.attrib['value'], 0)
+        if not value:
+            continue
+        # These fields are combination fields and are stupid
+        if 2 ** int(log2(value)) != value:
+            continue
+        padding = int(log2(value / prev)) - 1
+        if padding:
+            lines.append(f'_: u{padding},')
+        name = rename(e.attrib['name'], namespace)
+        lines.append(f'{name}: bool,')
+        prev = value
+    padding = 32 - int(log2(prev))
+    if padding:
+        lines.append(f'_: u{padding},')
+    return f"""packed struct {{
+        {'\n'.join(lines)}
+        comptime {{
+            if (@bitSizeOf(@This()) != 32)
+                @compileError("Invalid Bitfield in Protocol");
+        }}
+    }}"""
+
 def enum(element: ET.Element, namespace: str) -> str:
+    if 'bitfield' in element.attrib and element.attrib['bitfield'] == "true":
+        return bitfield(element, namespace);
     entries = [child for child in element if child.tag == 'entry']
     return f"""enum(u32) {{
         {'\n'.join(enumEntry(e, namespace) for e in entries)}
@@ -189,7 +226,8 @@ def protocol(root: ET.Element):
     interfaces = [
         interface(child, namespace)
         for child in root
-        if child.tag == 'interface'
+        if child.tag == 'interface' and
+            child.attrib['name'] not in deprecated
     ]
 
     return f"""
@@ -244,7 +282,8 @@ def main(args):
         interfaces += [
             (root.attrib['name'], namespace, i.attrib['name'])
             for i in root
-            if i.tag == 'interface'
+            if i.tag == 'interface' and
+                i.attrib['name'] not in deprecated
         ]
 
     fnptr = '?struct { context: *anyopaque, call: *const fn (*anyopaque, u32, enum {}, []const u8) void, },'
