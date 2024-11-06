@@ -151,3 +151,20 @@ Handles generating a new frame.
 #### Queue
 
 An event queue.
+
+### Seat
+
+Contains an event queue.
+
+Somehow links to [#Window] to get window based events, like window closing.
+
+Manages multiple input devices using a `wl_seat` wayland object.
+
+#### Poll
+
+Grab the next event or `null` if there are none left.
+
+#### Update?
+
+Updating the data should all be handled through wayland event helpers.
+
