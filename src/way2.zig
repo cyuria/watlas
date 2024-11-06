@@ -233,7 +233,10 @@ pub const Client = struct {
         self: *Client,
         object: u32,
         request: anytype,
-    ) !void {
+    ) error{
+        WaylandConnection,
+        WaylandDisconnected,
+    }!void {
         const body = switch (request) {
             inline else => |payload| serialiseStruct(self.allocator, payload),
         };
@@ -384,7 +387,11 @@ pub const Client = struct {
     }
 
     /// Waits for, receives and handles a single wayland event
-    pub fn recv(self: *Client) !void {
+    pub fn recv(self: *Client) error{
+        WaylandConnection,
+        WaylandDisconnected,
+        InvalidWaylandMessage,
+    }!void {
         const reader = self.socket.?.reader();
 
         const header = reader.readStruct(extern struct {
@@ -679,6 +686,7 @@ pub const Window = struct {
     ) !void {
         self.size = size;
         self.buffer = try Buffer.init(@sizeOf(type2.Pixel));
+        errdefer self.buffer.deinit();
         self.frame.buffer = FrameBuffer.init(&self.buffer, 0, 1, 1);
 
         while (!self.client.globals.objects.contains("wl_compositor")) {
@@ -687,27 +695,34 @@ pub const Window = struct {
 
         log.debug("binding wl_compositor", .{});
         self.wl.compositor = self.client.bind(.wl_compositor);
+        errdefer {
+            self.client.invalidate(self.wl.compositor);
+            self.wl.compositor = 0;
+        }
         const wl_compositor = self.client.globals.objects.get("wl_compositor").?;
         self.client.send(Client.wl_registry, wayland.registry.rq{ .bind = .{
             .id = self.wl.compositor,
             .name = wl_compositor.name,
             .version = wl_compositor.version,
             .interface = wl_compositor.string,
-        } }) catch {
-            self.client.invalidate(self.wl.compositor);
+        } }) catch |e| {
             self.client.free.append(self.wl.compositor) catch |err| {
                 log.err("Error received while cleaning up {}", .{err});
             };
             self.wl.compositor = 0;
+            return e;
         };
 
         log.debug("creating wl_surface", .{});
         self.wl.surface = self.client.bind(.wl_surface);
+        errdefer {
+            self.client.invalidate(self.wl.surface);
+            self.wl.surface = 0;
+        }
         try self.client.send(self.wl.compositor, wayland.compositor.rq{ .create_surface = .{
             .id = self.wl.surface,
         } });
         errdefer {
-            self.client.invalidate(self.wl.surface);
             self.client.send(self.wl.surface, wayland.surface.rq{ .destroy = .{} }) catch |err| {
                 log.err("Error received while cleaning up {}", .{err});
             };
@@ -732,7 +747,6 @@ pub const Window = struct {
                     .interface = xdg_wm_base.string,
                 } });
                 errdefer {
-                    self.client.invalidate(self.role.xdg.wm_base);
                     self.client.send(
                         self.role.xdg.wm_base,
                         xdg_shell.wm_base.rq{ .destroy = .{} },
@@ -783,22 +797,45 @@ pub const Window = struct {
 
         log.debug("binding wl_shm", .{});
         self.wl.shm = self.client.bind(.wl_shm);
+        errdefer {
+            self.client.invalidate(self.wl.shm);
+            self.wl.shm = 0;
+        }
         const wl_shm = self.client.globals.objects.get("wl_shm") orelse {
             return error.UnsupportedCompositor;
         };
-        try self.client.send(Client.wl_registry, wayland.registry.rq{ .bind = .{
-            .id = self.wl.shm,
-            .name = wl_shm.name,
-            .version = wl_shm.version,
-            .interface = wl_shm.string,
-        } });
+        try self.client.send(
+            Client.wl_registry,
+            wayland.registry.rq{ .bind = .{
+                .id = self.wl.shm,
+                .name = wl_shm.name,
+                .version = wl_shm.version,
+                .interface = wl_shm.string,
+            } },
+        );
+        errdefer {
+            self.client.send(
+                self.wl.shm,
+                wayland.shm.rq{ .release = .{} },
+            ) catch |err| {
+                log.err("Error received while cleaning up {}", .{err});
+            };
+        }
 
         log.debug("creating wl_shm_pool", .{});
         self.wl.pool = self.client.bind(.wl_shm_pool);
-        self.client.sendFd(self.wl.shm, wayland.shm.rq{ .create_pool = .{
+        try self.client.sendFd(self.wl.shm, wayland.shm.rq{ .create_pool = .{
             .id = self.wl.pool,
             .size = @intCast(self.buffer.pool.len),
-        } }, self.buffer.shm) catch log.err("Unrecoverable Wayland Connection Error", .{});
+        } }, self.buffer.shm);
+        errdefer {
+            self.client.send(
+                self.wl.shm,
+                wayland.shm.rq{ .release = .{} },
+            ) catch |err| {
+                log.err("Error received while cleaning up {}", .{err});
+            };
+        }
 
         log.debug("creating wl_buffer", .{});
         self.wl.buffer = self.client.bind(.wl_buffer);
